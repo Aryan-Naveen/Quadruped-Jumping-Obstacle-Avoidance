@@ -23,13 +23,14 @@ from scipy.spatial.transform import Rotation as R
 def test(args):
     torch.manual_seed(0)
     np.random.seed(0)
-    args.task = "go1_forward"
+    args.task = "go1_upwards"
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     # override some parameters for testing
     env_cfg.env.num_envs = min(env_cfg.env.num_envs, 50)
+    env_cfg.env.render_mode = "rgb_array"
 
     # Terrain:
-    env_cfg.commands.randomize_commands = True
+    env_cfg.commands.randomize_commands = False
 
     # env_cfg.terrain.curriculum = True
     # env_cfg.terrain.terrain_kwargs = { 'type':'box_terrain', 'box_width': 0.6, 'box_height':0.6}
@@ -47,7 +48,7 @@ def test(args):
 #----------------------Noise and domain rand:--------------------------------
     env_cfg.noise.add_noise = False
     env_cfg.noise.noise_level = 1.
-    env_cfg.domain_rand.randomize_friction = True
+    env_cfg.domain_rand.randomize_friction = False
     env_cfg.domain_rand.ranges.friction_range = [1.0,1.0]
     
     env_cfg.domain_rand.randomize_robot_pos = False
@@ -69,6 +70,9 @@ def test(args):
     env_cfg.domain_rand.randomize_joint_armature = False
     env_cfg.domain_rand.ranges.joint_armature_range = [1e-2,1e-2]
 
+    env_cfg.env.obstacle_radius_range = [10, 10.1]
+    
+
     
     
     env_cfg.domain_rand.randomize_restitution = False
@@ -76,13 +80,13 @@ def test(args):
     env_cfg.domain_rand.randomize_com = False
     env_cfg.domain_rand.ranges.com_displacement_range = [0.1,0.1]
 #-------------------------------------------------------
-    env_cfg.domain_rand.randomize_has_jumped = True
+    env_cfg.domain_rand.randomize_has_jumped = False
     env_cfg.domain_rand.has_jumped_random_prob = 1.0
     env_cfg.domain_rand.reset_has_jumped = True
     env_cfg.domain_rand.manual_has_jumped_reset_time = 100
 #-------------------------------------------------------
-    env_cfg.domain_rand.randomize_joint_friction = True
-    env_cfg.domain_rand.randomize_joint_damping = True
+    env_cfg.domain_rand.randomize_joint_friction = False
+    env_cfg.domain_rand.randomize_joint_damping = False
     env_cfg.domain_rand.ranges.joint_friction_range = [0.04,0.04]
     env_cfg.domain_rand.ranges.joint_damping_range = [0.01,0.01]
 
@@ -94,7 +98,7 @@ def test(args):
 
 
     env_cfg.domain_rand.push_towards_goal = False
-    env_cfg.domain_rand.sim_latency = True
+    env_cfg.domain_rand.sim_latency = False
     env_cfg.domain_rand.randomize_lag_timesteps = False
 
     # env_cfg.domain_rand.sim_pd_latency = False
@@ -118,7 +122,7 @@ def test(args):
     env_cfg.commands.upward_jump_probability = 0.
 
     env_cfg.env.throttle_to_real_time = False
-    env_cfg.viewer.camera_track_robot = False
+    env_cfg.viewer.camera_track_robot = True
     env_cfg.viewer.ref_env = 0
     env_cfg.viewer.simulate_camera = False
 
@@ -137,9 +141,10 @@ def test(args):
     env_cfg.env.reset_height = 0.02
 
     # prepare environment
-    args.load_run = "Aug04_11-10-21_"
-    # args.checkpoint = 4000
+    args.load_run = "Dec12_21-58-23_"
 
+    # args.load_run = "Dec12_14-48-56_"
+    # args.load_run = "Dec12_01-32-34_"
 
 # 
 
@@ -148,6 +153,11 @@ def test(args):
 
 
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
+    # gym = gymapi.acquire_gym()
+    # env = gym.wrappers.RecordVideo(env=env, video_folder="/home/naliseas-workstation/Documents/anaveen", name_prefix="test-video", episode_trigger=lambda x: x % 2 == 0)
+    ###
+    # Start the recorder
+    # env.start_video_recorder()
     obs = env.get_observations()
     # load policy
     train_cfg.runner.resume = True
@@ -202,6 +212,7 @@ def test(args):
 
     env.additional_termination_conditions = False
 
+    input("Press Enter to continue...")
     for i in range(int(1*env.max_episode_length-3)):
 
         actions = policy(obs.detach())
@@ -211,6 +222,7 @@ def test(args):
         action_rate.append((actions.detach().cpu().numpy() - env.last_actions.detach().cpu().numpy())/env.dt)
         action_rate_2.append((actions.detach().cpu().numpy() - 2*env.last_actions.detach().cpu().numpy() + env.last_last_actions.detach().cpu().numpy())/env.dt)
         obs, _, rews, dones, infos = env.step(actions.detach())
+        env.render()
         
         if first_time:
             saved_commands = env.commands.clone().cpu().numpy()
@@ -271,6 +283,12 @@ def test(args):
       
         mean_tracking_error_per_step.append(torch.mean(env.tracking_error_store[env.tracking_error_store!=0.0]).to('cpu'))
 
+    ####
+    # Don't forget to close the video recorder before the env!
+    # env.close_video_recorder()
+
+    # Close the environment
+    # env.close()
      
     mid_air_tensor = torch.tensor(np.array(mid_air))
     flight_time_all = torch.count_nonzero(mid_air_tensor,dim=0) * env.dt
@@ -336,153 +354,7 @@ def test(args):
 
     print(f"Mean flight time: {flight_time_mean}")
     reset_envs = reset_envs.cpu().numpy()
-    col = np.where(reset_envs==True,0,np.where(reset_envs==False,1,2))
-    cmap = colors.ListedColormap(['r','k','g'])
 
-    # Convert to array of integers with range 1 to 40 depending on percentage error
-    percentage_error = env.tracking_error_percentage_store.cpu().numpy() * 100
-    # m = interp1d([0,np.max(percentage_error)],[20,100])
-
-    s = (percentage_error+10).astype(int)
-
-    plt.rcParams.update({'font.size': 24})
-    plt.rcParams['lines.markersize'] = 10
-    plt.rcParams['figure.figsize'] = (20, 10)
-    plt.rcParams['axes.grid'] = True
-    plt.rcParams['legend.framealpha'] = 1.
-
-    fig,ax = plt.subplots(1)
-    fig.suptitle('Success rate')
-    if env_cfg.env.jump_type == "forward":
-        scatter = ax.scatter(saved_commands[:,0], saved_commands[:,1], c=col, cmap=cmap,s=s, marker='X')
-    else:
-        pass
-
-    landing_poses = env.landing_poses.cpu().numpy()
-    initial_root_states = env.initial_root_states.cpu().numpy()
- 
-
-    fig,ax = plt.subplots(1)
-    fig.suptitle('Desired Distance vs Actual Distance')
-    landing_poses_filtered = landing_poses.copy()
-    idx = np.isnan(landing_poses_filtered[:,2])
-    landing_poses_filtered[idx,2] = 0.0
-    achieved_dist = np.linalg.norm(landing_poses[:,:2] - initial_root_states[:,:2],axis=-1)# - saved_commands[:,:2],axis=-1)
-    dist = np.linalg.norm(saved_commands[:,:2],axis=-1)
-    ax.scatter(dist,achieved_dist, c=col, s=20, marker='X')
-    line = np.linspace(0,ax.get_xlim(),100)
-    ax.plot(line,line,'k--')
-    ax.set_xlabel('Desired Distance [m]')
-    ax.set_ylabel('Actual Distance [m]')
-
-
-
-    des_joint_angles = env_cfg.init_state.spring_rest_pos.cpu().numpy() + actions_scaled_stored
-
-    fig,ax = plt.subplots(4,1)
-    fig.suptitle('Joint angles')
-    colours = ['b','g','r']
-    for i in range(4):
-        ax[i].plot(joint_angles[:,3*i+0],'b')
-        ax[i].plot(joint_angles[:,3*i+1],'g')
-        ax[i].plot(joint_angles[:,3*i+2],'r')
-        ax[i].plot(des_joint_angles[:,3*i+0],'b--')
-        ax[i].plot(des_joint_angles[:,3*i+1],'g--')
-        ax[i].plot(des_joint_angles[:,3*i+2],'r--')
-        for j in range(3):
-            ax[i].axhline(y=env.dof_pos_limits_urdf.cpu().numpy()[i*3+j,0], color=colours[j], linestyle='--')
-            ax[i].axhline(y=env.dof_pos_limits_urdf.cpu().numpy()[i*3+j,1], color=colours[j], linestyle='--')
-    fig,ax = plt.subplots(4,1)
-    fig.suptitle('Joint velocities')
-    for i in range(4):
-        ax[i].plot(joint_vels[:,3*i+0],'b')
-        ax[i].plot(joint_vels[:,3*i+1],'g')
-        ax[i].plot(joint_vels[:,3*i+2],'r')
-        for j in range(3):
-            ax[i].axhline(y=env.dof_vel_limits.cpu().numpy()[i*3+j], color=colours[j], linestyle='--')
-            ax[i].axhline(y=-env.dof_vel_limits.cpu().numpy()[i*3+j], color=colours[j], linestyle='--')
-    fig,ax = plt.subplots(4,3)
-    fig.suptitle('Joint Torques')
-    ax = ax.ravel()
-    for i in range(12):
-        ax[i].plot(torques[:,i],'r')
-        ax[i].plot(energy_used[:,i],'g--')
-        ax[i].plot(spring_torques[:,i],'b')
-        ax[i].axhline(y=env.torque_limits.cpu().numpy()[i], color=colours[j], linestyle='--')
-        ax[i].axhline(y=-env.torque_limits.cpu().numpy()[i], color=colours[j], linestyle='--')
-
-
-    fig,ax = plt.subplots(1)
-    fig.suptitle('Joint Friction Coeffs vs Flight time')
-    ax.scatter(np.mean(env.joint_friction_coeffs.cpu().numpy(),axis=-1),flight_time_all.cpu().numpy())
-    fig,ax = plt.subplots(4,3)
-    fig.suptitle('Joint Acceleration and Jerk')
-    ax = ax.ravel()
-    for i in range(12):
-        ax[i].plot(dof_acc[:,i],'b')
-        ax[i].plot(joint_jerk[:,i],'g--')
-
-    fig,ax = plt.subplots(1,1)
-    fig.suptitle('Contact states')
-    for i in range(4):
-        ax.plot(contacts[:,i],label=f"Foot {i}")
-        ax.plot(mid_air[:],'k--')
-        ax.legend()
-
-    fig,ax = plt.subplots(4,1)
-    fig.suptitle('Base orientation')
-    labels = ['Roll','Pitch','Yaw','Ori Error']
-    labels_des = ['Des Roll','Des Pitch','Des Yaw','Des Ori Error']
-    for i in range(3):
-        ax[i].plot(euler[:,i],'b',label=labels[i])
-        ax[i].plot(des_angles_euler[:,i],'g',label=labels_des[i])
-        ax[i].legend()
-
-    ax[3].plot(ori_error[:],'b',label=labels[3])
-    ax[3].plot(0*ori_error[:],'g',label=labels_des[3])
-    ax[3].legend()
-
-
-    fig,ax = plt.subplots(3,3)
-    fig.suptitle('Base Position, Velocity, Acceleration')
-    labels = ['X','Y','Z']
-    command_vels = command_vels[:3] * np.ones_like(base_vel_global)
-    command_vels[~mid_air,:] = 0.0
-    for i in range(3):
-        ax[i,0].plot(base_pos[:,i] - initial_root_states[des_env,i],label=f"{labels[i]} pos")
-        ax[i,1].plot(base_vel_global[:,i],label=f"{labels[i]} vel")
-        ax[i,1].plot(command_vels[:,i],'g',label=f"{labels[i]} des vel")
-        ax[i,1].plot(base_lin_vel_imu[:,i],'r',label=f"{labels[i]} vel imu")
-        ax[i,2].plot(base_acc[:,i],label=f"{labels[i]} acc")
-        ax[i,2].plot(imu_state[:,i],'g',label=f"IMU {labels[i]}")
-
-    fig,ax = plt.subplots(3,1)
-    fig.suptitle('Feet vel')
-    for i in range(4):
-        ax[0].plot(feet_vel[:,i,0],label=f"Foot {i}, X")
-        ax[1].plot(feet_vel[:,i,1],label=f"Foot {i}, Y")
-        ax[2].plot(feet_vel[:,i,2],label=f"Foot {i}, Z")
-
-        ax[0].legend()
-        ax[1].legend()
-        ax[2].legend()
-    ax[0].plot(mid_air[:],'k--',label="Mid air")
-    ax[1].plot(mid_air[:],'k--',label="Mid air")
-    ax[2].plot(mid_air[:],'k--',label="Mid air")
-    rew_logs = env.reward_logs
-    fig,ax = plt.subplots(8,3)
-    ax = ax.ravel()
-    fig.suptitle('Rewards')
-    i = 0
-    k = 0
-    for name in rew_logs:
-
-        rew = torch.stack(rew_logs[name]).detach().cpu().numpy()
-        ax[i].plot(rew,label=name)
-        ax[i].legend(prop = { "size": 12 })
-        i += 1
-
-    plt.show()
 
 if __name__ == '__main__':
     args = get_args()

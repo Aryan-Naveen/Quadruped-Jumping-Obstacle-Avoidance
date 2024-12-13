@@ -74,6 +74,8 @@ class LeggedRobot(BaseTask):
         self.debug_viz = False
         self.init_done = False
         self._parse_cfg(self.cfg)
+        
+        self.collision_count = 0
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
 
         if not self.headless:
@@ -119,6 +121,14 @@ class LeggedRobot(BaseTask):
             if self.cfg.env.throttle_to_real_time:
                 self.gym.sync_frame_time(self.sim)
         self.post_physics_step()
+        self.obstacle_polar_b[:, 0] = self.obstacle_polar_b[:, 0] - self.obstacle_vel.squeeze(1) * self.dt
+        self.obstacle_endpoints[:, 1, 0] = self.obstacle_polar_b[:, 0] * torch.cos(self.obstacle_polar_b[:, 1]) + self.root_states[:, 0]
+        self.obstacle_endpoints[:, 1, 1] = self.obstacle_polar_b[:, 0] * torch.sin(self.obstacle_polar_b[:, 1]) + self.root_states[:, 1]
+        self.obstacle_endpoints[:, 0, 0] = self.obstacle_endpoints[:, 1, 0] - self.cfg.env.obstacle_length/2 * torch.cos(self.obstacle_yaw).squeeze(1)            
+        self.obstacle_endpoints[:, 0, 1] = self.obstacle_endpoints[:, 1, 1] - self.cfg.env.obstacle_length/2 * torch.sin(self.obstacle_yaw).squeeze(1)            
+        self.obstacle_endpoints[:, 2, 0] = self.obstacle_endpoints[:, 1, 0] + self.cfg.env.obstacle_length/2 * torch.cos(self.obstacle_yaw).squeeze(1)            
+        self.obstacle_endpoints[:, 2, 1] = self.obstacle_endpoints[:, 1, 1] + self.cfg.env.obstacle_length/2 * torch.sin(self.obstacle_yaw).squeeze(1)            
+
 
         if not self.headless:
 
@@ -321,13 +331,61 @@ class LeggedRobot(BaseTask):
             # self.reset_buf[torch.any(torch.abs((self.actions - 2*self.last_actions + self.last_last_actions) / (self.dt**2)) > 30000,dim=-1)] = True
 
             grav_acc_violated = (self.base_acc[:,2] < -9.81) * (self.base_acc_prev[:,2] < -9.81) * ~torch.all(~self.contacts,dim=-1)#~self.mid_air
-            self.reset_buf[grav_acc_violated] = True        
+            self.reset_buf[grav_acc_violated] = True 
+            
+        if self.cfg.env.active_dynamic_obstacle:
+            
+            self.reset_buf[self.check_collided_obstacles()] = True 
+            self.collision_count += self.check_collided_obstacles().sum()
+        
+        print(self.collision_count)
+                
 
         # If joint velocity exceeds a threshold, reset:
         # self.reset_buf[torch.logical_and(~self.was_in_flight,torch.any((torch.abs(self.dof_vel) - self.dof_vel_limits) > 10,dim=-1))] = True
 
         self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
         self.reset_buf |= self.time_out_buf
+
+
+    def check_collided_obstacles(self, eps= 0.1):
+        """
+        Check if each line segment is within epsilon distance of its corresponding set of points.
+
+        Args:
+            line_starts (Tensor): Start points of the line segments, shape (N, D).
+            line_ends (Tensor): End points of the line segments, shape (N, D).
+            point_sets (Tensor): Points to check, shape (N, M, D), where M is the number of points per set.
+            epsilon (float): Threshold distance.
+
+        Returns:
+            Tensor: Boolean tensor of shape (N, M) indicating if each point is within epsilon distance of its line segment.
+        """
+        obstacle_start = self.obstacle_endpoints[:, 0]
+        obstacle_end = self.obstacle_endpoints[:, 2]
+        # Vector representing each line segment
+        obstacle_vecs = obstacle_end - obstacle_start  # Shape (N, D)
+        
+        # Vectors from line starts to each set of points
+        feet_vecs = self.feet_pos - obstacle_start.unsqueeze(1)  # Shape (N, M, D)
+        
+        # Project each point onto its corresponding line vector
+        t = torch.clamp(
+            torch.sum(feet_vecs * obstacle_vecs.unsqueeze(1), dim=-1) / torch.sum(obstacle_vecs**2, dim=-1, keepdim=True),
+            0, 1
+        )  # Shape (N, M)
+        
+        # Closest points on the line segments
+        closest_points = obstacle_start.unsqueeze(1) + t.unsqueeze(-1) * obstacle_vecs.unsqueeze(1)  # Shape (N, M, D)
+        
+        # Compute distances from the closest points to the original points
+        distances = torch.norm(self.feet_pos - closest_points, dim=-1)  # Shape (N, M)
+        
+        collided = distances.min(axis=1).values <= eps
+        # Check if each distance is within epsilon
+        # if collided.sum() > 0:
+        #     print(collided.sum())
+        return collided
 
     def check_jump(self):
         """ Check if the robot has jumped
@@ -432,6 +490,9 @@ class LeggedRobot(BaseTask):
 
         # At each reset, reset the spring parameters (or leave them as default if no randomisation):
         self._reset_spring_params(env_ids)
+        
+        # At each reset, reset the obstacle with a random distance and velocity
+        self._reset_dynamic_obstacle(env_ids)
 
 
         # Simulate episodic latency:
@@ -576,6 +637,9 @@ class LeggedRobot(BaseTask):
         
         self.base_lin_vel_stored = torch.roll(self.base_lin_vel_stored, 1, dims=2)
         self.base_lin_vel_stored[:,:,0] = self.base_lin_vel_history.clone() 
+        
+        self.perception_output_stored = torch.roll(self.perception_output_stored, 1, dims=2)
+        self.perception_output_stored[:, :, 0] = self.perception_output_history.clone()
 
         self.base_ang_vel_stored = torch.roll(self.base_ang_vel_stored, 1, dims=2)
         self.base_ang_vel_stored[:,:,0] = self.base_ang_vel_history.clone()
@@ -789,6 +853,13 @@ class LeggedRobot(BaseTask):
         #         gaussian_std = torch.sqrt((2*self.noise_scale_vec)**2/12)
         #         self.obs_buf += torch.normal(torch.zeros_like(self.noise_scale_vec_no_history),gaussian_std).flatten()
 
+        if self.cfg.env.perception_module:
+            self.perception_output = torch.zeros((self.num_envs, 10), dtype=torch.float, requires_grad=False, device=self.device)
+            if self.cfg.env.active_dynamic_obstacle:
+                self.perception_output[:, 0] = 1           
+                self.perception_output[:, 1:] = self.obstacle_endpoints.reshape(self.num_envs, -1)
+            self.obs_buf = torch.cat((self.obs_buf, self.perception_output_delayed), dim= -1)
+            
     def create_sim(self):
         """ Creates simulation, terrain and evironments
         """
@@ -1308,6 +1379,8 @@ class LeggedRobot(BaseTask):
         # self.contacts_delayed = self.force_sensor_delayed[:,:,2] > 1
         # self.has_jumped_delayed = self._interpolate_obs(idx,sampled_latency,self.has_jumped_stored.int()).bool()
         self.has_jumped_delayed = self.has_jumped.clone()
+        self.perception_output_delayed = self._interpolate_obs(idx, sampled_latency, self.perception_output_stored)
+        
     def _interpolate_obs(self,idx,sampled_latency,obs_history,is_quat=False):
         ''' Interpolate between two observations based on the latency and the index of the closest observation.
         For quaternions use SLERP.
@@ -1504,6 +1577,23 @@ class LeggedRobot(BaseTask):
             self.spring_damping[env_ids] *= D_variation.repeat(1,4)
             self.spring_rest_pos[env_ids] += rest_pos_variation.repeat(1,4)
             
+    def _reset_dynamic_obstacle(self, env_ids):
+        self.obstacle_polar_b[env_ids, 0] = torch.distributions.uniform.Uniform(self.cfg.env.obstacle_radius_range[0], self.cfg.env.obstacle_radius_range[1]).sample(self.obstacle_polar_b[env_ids, 0].shape).to(self.device)
+        self.obstacle_polar_b[env_ids, 1] = torch.distributions.uniform.Uniform(-torch.pi, torch.pi).sample(self.obstacle_polar_b[env_ids, 1].shape).to(self.device)        
+        yaw_lb = (torch.pi/2 - self.obstacle_polar_b[env_ids, 1]) - torch.pi/3
+        yaw_ub = (torch.pi/2 - self.obstacle_polar_b[env_ids, 1]) + torch.pi/3                
+        self.obstacle_yaw[env_ids] = torch.distributions.uniform.Uniform(yaw_lb, yaw_ub).sample().reshape(self.obstacle_yaw[env_ids].shape).to(self.device)
+
+        self.obstacle_vel[env_ids] = torch.distributions.uniform.Uniform(self.cfg.env.obstacle_vel_range[0], self.cfg.env.obstacle_vel_range[1]).sample(self.obstacle_vel[env_ids].shape).to(self.device)
+        
+        self.obstacle_endpoints[:, 1, 0] = self.obstacle_polar_b[:, 0] * torch.cos(self.obstacle_polar_b[:, 1]) + self.root_states[:, 0]
+        self.obstacle_endpoints[:, 1, 1] = self.obstacle_polar_b[:, 0] * torch.sin(self.obstacle_polar_b[:, 1]) + self.root_states[:, 1]
+        self.obstacle_endpoints[:, 0, 0] = self.obstacle_endpoints[:, 1, 0] - self.cfg.env.obstacle_length/2 * torch.cos(self.obstacle_yaw).squeeze(1)            
+        self.obstacle_endpoints[:, 0, 1] = self.obstacle_endpoints[:, 1, 1] - self.cfg.env.obstacle_length/2 * torch.sin(self.obstacle_yaw).squeeze(1)            
+        self.obstacle_endpoints[:, 2, 0] = self.obstacle_endpoints[:, 1, 0] + self.cfg.env.obstacle_length/2 * torch.cos(self.obstacle_yaw).squeeze(1)            
+        self.obstacle_endpoints[:, 2, 1] = self.obstacle_endpoints[:, 1, 1] + self.cfg.env.obstacle_length/2 * torch.sin(self.obstacle_yaw).squeeze(1)            
+
+        
     def _reset_state_history(self,env_ids):
         """ Resets state history of selected environments"""
         hist_len = self.cfg.env.state_history_length
@@ -1534,6 +1624,7 @@ class LeggedRobot(BaseTask):
 
         self.pd_dof_pos_stored[env_ids] = self.dof_pos[env_ids,:].unsqueeze(-1)
         self.pd_dof_vel_stored[env_ids] = self.dof_vel[env_ids,:].unsqueeze(-1)
+        self.perception_output_stored[env_ids] = self.perception_output[env_ids,:].repeat(1, self.cfg.env.state_history_length).unsqueeze(-1)
         
         
      
@@ -1840,6 +1931,9 @@ class LeggedRobot(BaseTask):
         
         if self.cfg.env.known_contact_feet: # Pass contact state at the feet (4*state_history_length)
             num_observations += 4*state_history_length
+        
+        if self.cfg.env.perception_module:
+            num_observations += 10*state_history_length
 
         return num_observations
 
@@ -2057,6 +2151,10 @@ class LeggedRobot(BaseTask):
         # initialize some data used later on
         self.common_step_counter = 0
         self.extras = {}
+        self.obstacle_polar_b = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False)
+        self.obstacle_endpoints = torch.zeros((self.num_envs, 3, 3), device = self.device, requires_grad=False)
+        self.obstacle_vel = torch.zeros(self.num_envs, 1, dtype=torch.float, device=self.device, requires_grad=False)
+        self.obstacle_yaw = torch.zeros(self.num_envs, 1, dtype=torch.float, device=self.device, requires_grad=False)
         self.noise_scale_vec = self._get_noise_scale_vec(self.cfg)
         self.noise_scale_vec_no_history = self._get_noise_scale_vec_without_history(self.cfg)
         self.gravity_vec = to_torch(get_axis_params(-1., self.up_axis_idx), device=self.device).repeat((self.num_envs, 1))
@@ -2089,6 +2187,7 @@ class LeggedRobot(BaseTask):
         self.not_pushed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.settled_after_init = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
+        self.perception_output = torch.zeros(self.num_envs, 10, dtype=torch.float, requires_grad=False, device=self.device)
         self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.feet_pos = torch.zeros(self.num_envs, len(self.feet_indices), 3, dtype=torch.float, device=self.device, requires_grad=False)
         self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
@@ -2152,6 +2251,7 @@ class LeggedRobot(BaseTask):
             self.ori_error_history = torch.zeros(self.num_envs, self.cfg.env.state_history_length, dtype=torch.float, device=self.device, requires_grad=False)
             # self.error_quat_history = torch.zeros(self.num_envs, 4*self.cfg.env.state_history_length, dtype=torch.float, device=self.device, requires_grad=False)
             self.has_jumped_history = torch.zeros(self.num_envs, self.cfg.env.state_history_length, dtype=torch.bool, device=self.device, requires_grad=False)
+            self.perception_output_history = torch.zeros(self.num_envs, 10*self.cfg.env.state_history_length, dtype=torch.float, device=self.device, requires_grad=False)
         if self.cfg.env.pass_remaining_time:
             self.remaining_time = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         
@@ -2180,6 +2280,8 @@ class LeggedRobot(BaseTask):
         # self.error_quat_stored = torch.zeros(self.num_envs, self.cfg.env.state_history_length*4,self.cfg.env.state_stored_length, dtype=torch.float, device=self.device, requires_grad=False)
         self.force_sensor_stored = torch.zeros(self.num_envs, self.cfg.env.state_history_length*4, 3,self.cfg.env.state_stored_length, dtype=torch.float, device=self.device, requires_grad=False)
         self.has_jumped_stored = torch.zeros(self.num_envs, self.cfg.env.state_history_length*1,self.cfg.env.state_stored_length, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.perception_output_stored = torch.zeros(self.num_envs, self.cfg.env.state_history_length*self.perception_output.shape[-1], self.cfg.env.state_stored_length, dtype=torch.float, device=self.device, requires_grad=False)
+
 
         self.base_lin_vel_delayed = torch.zeros_like(self.base_lin_vel_history)
         self.base_ang_vel_delayed = torch.zeros_like(self.base_ang_vel_history)
@@ -2192,7 +2294,8 @@ class LeggedRobot(BaseTask):
         self.ori_error_delayed = torch.zeros_like(self.ori_error_history)
         # self.error_quat_delayed = torch.zeros_like(self.error_quat_history)
         # self.force_sensor_delayed = torch.zeros_like(self.force_sensor_readings)
-        self.has_jumped_delayed = torch.zeros_like(self.has_jumped_history) 
+        self.has_jumped_delayed = torch.zeros_like(self.has_jumped_history)
+        self.perception_output_delayed = torch.zeros_like(self.perception_output_history) 
 
         self.latency_range = self.cfg.domain_rand.ranges.latency_range
         self.pd_latency_range = self.cfg.domain_rand.ranges.pd_latency_range
@@ -2521,6 +2624,7 @@ class LeggedRobot(BaseTask):
         self.cfg.domain_rand.gravity_rand_duration = np.ceil(
             self.cfg.domain_rand.gravity_rand_interval * self.cfg.domain_rand.gravity_impulse_duration)
 
+
     def _draw_debug_goal(self):
         """ Draws desired goal points for debugging.
             Default behaviour: draws goal position
@@ -2550,6 +2654,20 @@ class LeggedRobot(BaseTask):
                 colors[0] = (0,1,0)
                 self.gym.add_lines(self.viewer, self.envs[i], 3, verts, colors)
 
+            # base_pos = (self.root_states[i, :3]).cpu().numpy()
+            # heights = self.measured_heights[i].cpu().numpy()
+            start_point = self.obstacle_endpoints[i, 0, :]
+            end_point = self.obstacle_endpoints[i, 2, :]
+            t_values = torch.linspace(0, 1, 1024, device=self.device)
+            obstacle_points = start_point + t_values.unsqueeze(1) * (end_point - start_point)
+            for j in range(obstacle_points.shape[0]):
+                x = obstacle_points[j, 0]
+                y = obstacle_points[j, 1]
+                z = obstacle_points[j, 2]
+                sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
+                gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose) 
+
+
 
     def _draw_debug_vis(self):
         """ Draws visualizations for dubugging (slows down simulation a lot).
@@ -2561,17 +2679,25 @@ class LeggedRobot(BaseTask):
         self.gym.clear_lines(self.viewer)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
         
-        sphere_geom = gymutil.WireframeSphereGeometry(0.02, 4, 4, None, color=(1, 1, 0))
+        sphere_geom = gymutil.WireframeSphereGeometry(0.3, 4, 4, None, color=(1, 1, 0))
         for i in range(self.num_envs):
-            base_pos = (self.root_states[i, :3]).cpu().numpy()
-            heights = self.measured_heights[i].cpu().numpy()
-            height_points = quat_apply_yaw(self.base_quat[i].repeat(heights.shape[0]), self.height_points[i]).cpu().numpy()
-            for j in range(heights.shape[0]):
-                x = height_points[j, 0] + base_pos[0]
-                y = height_points[j, 1] + base_pos[1]
-                z = heights[j]
-                sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
-                gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose) 
+            # base_pos = (self.root_states[i, :3]).cpu().numpy()
+            # # heights = self.measured_heights[i].cpu().numpy()
+            # # height_points = quat_apply_yaw(self.base_quat[i].repeat(heights.shape[0]), self.height_points[i]).cpu().numpy()
+            # # for j in range(heights.shape[0]):
+            # #     x = height_points[j, 0] + base_pos[0]
+            # #     y = height_points[j, 1] + base_pos[1]
+            # #     z = heights[j]
+            # #     sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
+            # #     gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose) 
+            # # z = 0.15
+            # # x = self.obstacle_polar_b[i, 0] * torch.cos(self.obstacle_polar_b[i, 1]) + base_pos[0]
+            # # y = self.obstacle_polar_b[i, 0] * torch.sin(self.obstacle_polar_b[i, 1]) + base_pos[1]            
+            # # sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
+            
+            start_point = self.obstacle_endpoints[i, 0, :]
+            end_point = self.obstacle_endpoints[i, 2, :]
+            gymutil.draw_lines([[start_point, end_point]], self.gym, self.viewer, self.envs[i]) 
 
     def _init_height_points(self):
         """ Returns points at which the height measurments are sampled (in base frame)
@@ -2786,6 +2912,18 @@ class LeggedRobot(BaseTask):
         
         return rew
      
+    def _reward_collision_obstacle(self):
+        env_ids = torch.logical_or(self.episode_length_buf == self.max_episode_length,
+            torch.logical_and(self.reset_buf, self.episode_length_buf < self.max_episode_length))
+
+        rew = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
+
+        rew[env_ids * self.check_collided_obstacles()] = 1
+        
+        # print("GOT CALLED YAY!")
+
+        return rew
+        
     
     def _reward_task_max_height(self):
         # Reward for max height achieved during the episode:

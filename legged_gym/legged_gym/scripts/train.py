@@ -42,7 +42,7 @@ def train(args):
     # args.headless = True
     # args.resume = True
     # args.load_run = 'Mar02_17-00-01_'
-    # args.num_envs = 2
+    # args.num_envs = 25
     env, env_cfg = task_registry.make_env(name=args.task, args=args)
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
     

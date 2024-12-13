@@ -71,13 +71,14 @@ class Go1UpwardsCfg( LeggedRobotCfg ):
 
         jump_type = "upward" # "upward" or "forward" or "forward_with_obstacles"
 
-        continuous_jumping = False # if true: the robot states are not reset after each jump.
+        continuous_jumping = True # if true: the robot states are not reset after each jump.
         continuous_jumping_reset_probability = 0.9
         use_springs = False
         reset_height = 0.15 # [m]
         reset_landing_error = 0.2 # [in m]
 
-        debug_draw = False
+        debug_draw = True
+        debug_draw_line_goal = False
         throttle_to_real_time = False
 
         reset_orientation_error = 0.8 # [rad]
@@ -91,6 +92,12 @@ class Go1UpwardsCfg( LeggedRobotCfg ):
         known_ori_error = False   
         known_error_quaternion = False     
         object_information = True
+        
+        perception_module = True
+        active_dynamic_obstacle = True
+        obstacle_vel_range = [3.5, 7]
+        obstacle_radius_range = [5, 20]
+        obstacle_length = 0.645 # m length of robot
 
         num_observations = 0
         if not use_state_history:
@@ -123,6 +130,9 @@ class Go1UpwardsCfg( LeggedRobotCfg ):
         
         if known_contact_feet: # Pass contact state at the feet (4*state_history_length)
             num_observations += 4*state_history_length
+        
+        if perception_module:
+            num_observations += 10*state_history_length
         
         # num_observations += 187 # If measuring height of terrain
 
@@ -273,6 +283,8 @@ class Go1UpwardsCfg( LeggedRobotCfg ):
             
             termination = -20.
             jumping = 50.
+            
+            collision_obstacle = -50.
 
             #---------- Continuous rewards (at every time step): ----------- #
 
@@ -281,7 +293,7 @@ class Go1UpwardsCfg( LeggedRobotCfg ):
             post_landing_ori = 3. # Reward for returning to desired orientation after landing
 
             base_height_flight = 80. # Reward for being in the air, only active the first jump
-            base_height_stance = 5. # Reward fo
+            base_height_stance = 1. # Reward fo
 
             tracking_lin_vel = 5.0 # Reward for tracking desired linear velocity
             tracking_ang_vel = 0.5 # Reward for tracking desired angular velocity
